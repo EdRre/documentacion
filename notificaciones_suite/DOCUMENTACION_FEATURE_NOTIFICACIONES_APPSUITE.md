@@ -83,195 +83,55 @@ graph TB
 
 ## 🏗️ Cómo Funciona el Sistema
 
-### Visión General del Flujo
+El sistema transfiere notificaciones desde una cola en SQL Server a la API de Notificaciones Push a través de un proceso asíncrono orquestado por Cloud Scheduler.
 
-El sistema funciona en 3 fases secuenciales:
+### Fases del Proceso
+1.  **Generación:** Un Stored Procedure inserta la notificación en `conEmisionNotificacionesSuiteTbl` con estado `Pendiente`.
+2.  **Orquestación:** Cada 5 minutos, un Cloud Scheduler invoca al *Servicio Notificaciones*.
+3.  **Transferencia:** El servicio lee un lote de 200 notificaciones, las marca como `Procesando` y las envía una por una (con un delay de 1 segundo) a la API Push. El estado final en SQL Server será `Enviado` o `Error`.
 
-```mermaid
-graph TB
-    Start([Evento de Negocio]) --> Generate[FASE 1: GENERACIÓN<br/>SP inserta en SQL Server]
-    Generate --> Store[FASE 2: ORQUESTACIÓN<br/>Scheduler lee cola SQL]
-    Store --> Transfer[FASE 3: TRANSFERENCIA<br/>Servicio llama API Push]
-    Transfer --> API[API Notificaciones Push<br/>Sql Server snpti]
+### Flujo de Interacción
+Este diagrama muestra la secuencia de llamadas entre los componentes:
 
-    
-    style Generate fill:#e1f5ff
-    style Store fill:#fff4e1
-    style Transfer fill:#e8f5e9
-    style API fill:#ffe0b2
-```
-
-### Fase 1: Generación de Notificaciones
-
-Cuando ocurre el procesamiento de las notificaciones de conProcesosTbl de tipo push(ej: dispersión de préstamos, generación de recibos, campañas), los procedimientos almacenados de los motivos de correo del módulo correspondiente **registran** la notificación en la tabla central(conEmisionNotificacionesTbl).
-
-**¿Qué sucede?**
-1. El SP valida que el usuario destinatario esté activo
-2. Verifica que el usuario tenga acceso a la aplicación
-3. Prepara el contenido (asunto, cuerpo, URLs)
-4. Inserta un registro en `conEmisionNotificacionesSuiteTbl` con estado **Pendiente**
-
-### Fase 2: Almacenamiento en Cola
-
-La tabla `conEmisionNotificacionesSuiteTbl` actúa como una **cola persistente** que almacena:
-
-| Dato | Propósito |
-|------|-----------|
-| **idSession** | Agrupa notificaciones del mismo proceso/lote |
-| **idUsuarioDestinatario** | Identifica a quién va dirigida |
-| **asunto + body** | Contenido de la notificación |
-| **urlArchivos** | Enlaces a documentos adjuntos |
-| **idEstatus** | Estado actual (1=Pendiente, 2=Procesando, 3=Enviado, 4=Error) |
-| **fechaEnvioNotificacion** | Timestamp de cuándo se envió (NULL si está pendiente) |
-
-### Fase 3: Procesamiento y Transferencia a API Push
-
-Un **Cloud Scheduler** (`notificaciones-reenvio-notificaciones` en proyecto `plowserve`) invoca periódicamente el endpoint del Servicio Notificaciones, que lee la cola de SQL Server(ncti) y transfiere las notificaciones a la API Push de AppSuite.
-
-**Flujo del Sistema de Orquestación (hasta API Push):**
+### Flujo de Interacción
+Este diagrama muestra la secuencia de llamadas entre los componentes:
 
 ```mermaid
 sequenceDiagram
-    participant SP as Stored Procedures<br/>(Módulos de Negocio)
-    participant DB1 as SQL Server<br/>conEmisionNotificacionesSuiteTbl
-    participant CS1 as Cloud Scheduler<br/>notificaciones-reenvio
-    participant SRV as Servicio Notificaciones<br/>(.NET Cloud Run)
-    participant API as API Notificaciones Push<br/>(.NET Cloud Run)
-    participant DB2 as SQL Server-snpti<br/>Notifications
+    participant SP as Stored Procedures
+    participant DB1 as SQL Server
+    participant CS1 as Cloud Scheduler
+    participant SRV as Servicio Notificaciones
+    participant API as API Notificaciones Push
     
     Note over SP,DB1: FASE 1: Generación
-    SP->>DB1: INSERT notificación<br/>idEstatus = 1 (Pendiente)
+    SP->>DB1: INSERT en conEmisionNotificacionesSuiteTbl (Estatus=1)
     
-    Note over CS1,DB1: FASE 2: Lectura de Cola SQL
-    CS1->>SRV: POST /api/v1/notification<br/>(cada 5 min L-V 9AM-7PM)
-    SRV->>DB1: SELECT TOP 200<br/>WHERE idEstatus = 1
-    DB1-->>SRV: Lote de notificaciones pendientes
-    SRV->>DB1: UPDATE idEstatus = 2 (Procesando)
+    Note over CS1,SRV: FASE 2: Orquestación
+    CS1->>SRV: POST /api/v1/notification (cada 5 min)
     
-    Note over SRV,API: FASE 3: Transferencia a API Push
-    loop Por cada notificación del lote
-        SRV->>SRV: Delay 1 segundo
-        SRV->>API: POST /v1/notification/shedule<br/>{userId, title, description, scheduledDate}
-        API->>DB2: INSERT Notification<br/>Status = 1 (Scheduled)
-        
-        alt API Push acepta
-            API-->>SRV: 201 Created
-            SRV->>DB1: UPDATE idEstatus = 3 (Enviado)<br/>fechaEnvioNotificacion = NOW()
-        else API Push rechaza
-            API-->>SRV: 4xx/5xx Error
-            SRV->>DB1: UPDATE idEstatus = 4 (Error)<br/>observaciones = mensaje
+    Note over SRV,API: FASE 3: Transferencia
+    SRV->>DB1: SELECT TOP 200 (Estatus=1)
+    SRV->>DB1: UPDATE Estatus=2 (Procesando)
+    loop Por cada notificación
+        SRV->>SRV: Delay 1 seg
+        SRV->>API: POST /v1/notification/shedule
+        alt API Acepta
+            SRV->>DB1: UPDATE Estatus=3 (Enviado)
+        else API Rechaza
+            SRV->>DB1: UPDATE Estatus=4 (Error)
         end
     end
 ```
 
-### Explicación Detallada de Cada Fase
-
-#### **FASE 1: Generación de Notificaciones**
-- **Responsable:** Stored Procedures de módulos de negocio
-- **Acción:** INSERT en `conEmisionNotificacionesSuiteTbl`
-- **Estado inicial:** `idEstatus = 1` (Pendiente)
-- **Base de datos:** SQL Server
-- **Trigger:** Eventos de negocio (dispersión de préstamos, generación de recibos, campañas, etc.)
-
-#### **FASE 2: Lectura de Cola SQL Server**
-- **Scheduler:** `notificaciones-reenvio-notificaciones` (proyecto `plowserve`)
-- **Endpoint:** `POST https://servicionotificaciones-355837773731.us-central1.run.app/api/v1/notification`
-- **Frecuencia:** Cada 5 minutos
-- **Función:** Lee notificaciones pendientes de SQL Server en lotes de 200
-- **Protecciones:**
-  - Validación de proceso activo (previene duplicados)
-  - Procesamiento por lotes
-  - Rate limiting de 1 segundo entre envíos
-
-#### **FASE 3: Transferencia a API Push**
-- **Servicio origen:** `servicionotificaciones` (.NET Cloud Run)
-- **Endpoint destino:** `POST /v1/notification/shedule` (API Push)
-- **URL:** `https://servicionotificaciones-355837773731.us-central1.run.app/api/v1/notification/shedule`
-- **Función:** Por cada notificación del lote, llama a la API Push para programarla
-- **Datos transferidos:**
-  - `ApplicationIdDestination`: ID de AppSuite
-  - `ApplicationIdOrigin`: ID del módulo origen
-  - `UserId`: Usuario destinatario
-  - `Title`: Asunto (campo `asunto` de SQL)
-  - `Description`: Cuerpo (campo `body` de SQL)
-  - `ScheduledDate`: NOW() - se procesa inmediatamente
-  - `Data`: Metadata (RedirectMode: "webview", etc.)
-- **Estado en SQL tras éxito:** `idEstatus = 3` (Enviado) + `fechaEnvioNotificacion` poblada
-- **Estado en SQL tras error:** `idEstatus = 4` (Error) + mensaje en `observaciones`
-
-### Estados del Sistema de Orquestación
-
-El Servicio de Notificaciones maneja 4 estados en la tabla `conEmisionNotificacionesSuiteTbl` de SQL Server:
-
-### Características Clave del Sistema de Orquestación
-
-| Característica | Descripción | Beneficio |
-|----------------|-------------|-----------|
-| **Cola persistente en SQL** | `conEmisionNotificacionesSuiteTbl` almacena todas las notificaciones generadas | Garantiza que ninguna notificación se pierda |
-| **Scheduler periódico** | Cloud Scheduler invoca cada 5 minutos | Procesamiento automático sin intervención manual |
-| **Protección concurrencia** | Validación de procesos activos antes de leer cola | Previene envíos duplicados |
-| **Rate limiting** | 1 segundo de espera entre llamadas a API Push | Evita saturación del servicio destino |
-| **Procesamiento por lotes** | 200 notificaciones por ejecución | Optimiza throughput sin sobrecargar sistema |
-| **Trazabilidad completa** | Estados + timestamps + observaciones | Auditoría del flujo de cada notificación |
-| **Manejo de errores** | Estado 4 (Error) + mensaje descriptivo | Facilita diagnóstico y reintentos manuales |
-| **Desacoplamiento** | Sistema independiente de la API Push | Cada componente puede evolucionar independientemente |
-
-## 📋 Tabla Central: `conEmisionNotificacionesSuiteTbl`
-
-
-Esta tabla es el **corazón del sistema**. Almacena todas las notificaciones en cola.
-
-#### Estructura y Significado de Campos
-
-```sql
-CREATE TABLE dbo.conEmisionNotificacionesSuiteTbl
-(
-    -- Identificación
-    idEmision                   BIGINT IDENTITY(1,1) NOT NULL,  -- ID único de la notificación
-    idSession                   VARCHAR(30) NOT NULL,           -- Agrupa notificaciones del mismo proceso
-    
-    -- Clasificación
-    idAplicacion                SMALLINT NOT NULL,              -- Módulo origen (34=Campañas, etc.)
-    idMotivoCorreo              SMALLINT NOT NULL,              -- Tipo de notificación
-    
-    -- Destinatario
-    idUsuarioDestinatario       INTEGER NOT NULL,               -- Usuario que recibirá la notificación
-    
-    -- Contenido
-    asunto                      VARCHAR(1000) NOT NULL,         -- Título de la notificación
-    body                        VARCHAR(8000) NOT NULL,         -- Cuerpo del mensaje (puede incluir HTML)
-    urlArchivos                 VARCHAR(2000) NULL,             -- Links a documentos/archivos adjuntos
-    
-    -- Control y Auditoría
-    observaciones               VARCHAR(500) NULL,              -- Notas adicionales o mensajes de error
-    fechaEnvioNotificacion      DATETIME NULL,                  -- Cuándo se envió (NULL = no enviada aún)
-    idEstatus                   TINYINT NOT NULL DEFAULT 1,     -- 1=Pendiente, 2=Procesando, 3=Enviado, 4=Error
-    idUsuarioAct                INTEGER NOT NULL,               -- Quién creó el registro
-    fechaAct                    DATETIME NOT NULL DEFAULT GETDATE(), -- Cuándo se creó
-    
-    CONSTRAINT PK_conEmisionNotificacionesSuiteTbl PRIMARY KEY (idEmision)
-)
-```
-
-#### Índices para Rendimiento
-
-Los índices están diseñados para las consultas más frecuentes:
-
-| Índice | Columna | ¿Para qué se usa? |
-|--------|---------|-------------------|
-| **IX_idSession** | idSession | Consultar todas las notificaciones de un proceso específico |
-| **IX_idUsuarioDestinatario** | idUsuarioDestinatario | Ver notificaciones de un usuario |
-| **IX_idEstatus** | idEstatus | **CRÍTICO**: El job busca notificaciones pendientes `WHERE idEstatus = 1` |
-| **IX_fechaAct** | fechaAct | Ordenar notificaciones por antigüedad, limpieza de datos antiguos |
-
-### Catálogo de Estados
+### Ciclo de Vida de una Notificación (Estados)
 
 ```mermaid
 graph LR
-    A[1 - Pendiente] -->|Job recoge| B[2 - Procesando]
-    B -->|Éxito| C[3 - Enviado]
-    B -->|Fallo| D[4 - Con Error]
-    D -->|Reintento| B
+    A[1: Pendiente] -->|Scheduler lee| B[2: Procesando]
+    B -->|API Acepta| C[3: Enviado]
+    B -->|API Rechaza| D[4: Error]
+    D -->|Reintento Manual| A
     
     style A fill:#fff9c4
     style B fill:#bbdefb
@@ -279,96 +139,16 @@ graph LR
     style D fill:#ffcdd2
 ```
 
-| Estado | Valor | Significado | ¿Cuándo se usa? |
-|--------|-------|-------------|-----------------|
-| **Pendiente** | 1 | Notificación registrada, esperando procesamiento | Estado por defecto al insertar |
-| **Procesando** | 2 | El job está intentando enviarla | Mientras el servicio de notificaciones trabaja |
-| **Enviado** | 3 | Envío exitoso, `fechaEnvioNotificacion` poblada | Cuando el servicio confirma recepción |
-| **Con Error** | 4 | Fallo en el envío, revisar `observaciones` | Si el servicio retorna error o timeout |
+| Estado | Valor | Significado |
+|---|---|---|
+| **Pendiente** | 1 | Esperando ser procesada por el scheduler. |
+| **Procesando** | 2 | El servicio la está transfiriendo a la API Push. |
+| **Enviado** | 3 | La API Push la recibió y programó correctamente. |
+| **Con Error** | 4 | La API Push la rechazó. El motivo queda en `observaciones`. |
 
-## 🔌 Integración: ¿Cómo se Generan las Notificaciones?
+## 🚨 Runbook Operativo y Monitoreo
 
-### Patrón de Integración Estándar
-
-**Todos los procedimientos siguen el mismo patrón** de 5 pasos:
-
-```mermaid
-sequenceDiagram
-    participant SP as Stored Procedure
-    participant VAL as Validaciones
-    participant SUITE as conEmisionNotificacionesSuiteTbl
-    
-    SP->>SP: 1. Ejecutar lógica de negocio
-    SP->>VAL: 2. Validar destinatarios
-    VAL->>VAL: ¿Usuario activo?
-    VAL->>VAL: ¿Tiene acceso a app?
-    VAL->>VAL: ¿App permitida? (no App=2)
-    VAL-->>SP: ✓ Validaciones OK
-    SP->>SP: 3. Preparar contenido (asunto, body, URLs)
-    SP->>SUITE: 4. INSERT notificación
-    Note over SUITE: idEstatus = 1<br/>fechaEnvioNotificacion = NULL
-    SUITE-->>SP: ✓ Registro insertado
-    SP->>SP: 5. Incrementar contador
-```
-
-## ⚙️ Procesamiento: Detalles de Implementación
-
-El procesamiento de notificaciones se realiza en **dos etapas** con dos servicios independientes orquestados por Cloud Schedulers.
-
-### Configuración de Cloud Schedulers
-
-#### **Scheduler 1: Lectura de Cola SQL** (`notificaciones-reenvio-notificaciones`)
-
-| Parámetro | Valor | Descripción |
-|-----------|-------|-------------|
-| **Nombre** | `notificaciones-reenvio-notificaciones` | Identificador del job |
-| **Proyecto GCP** | `plowserve` | Proyecto de producción |
-| **Región** | `us-central1` | Central US (Iowa) |
-| **Endpoint** | `POST https://servicionotificaciones-355837773731.us-central1.run.app/api/v1/notification` | URL del servicio notificaciones |
-| **Schedule (cron)** | `*/5 * * * *` | Cada 5 min (GMT-6 México) |
-| **Timeout** | `180 segundos` | Máximo 3 minutos por ejecución |
-| **Retry Config** | `max-retry-duration: 0s` | Sin reintentos automáticos |
-| **Estado** | `ENABLED` | Activo en producción |
-| **Base de Datos** | SQL Server(ncti) | `conEmisionNotificacionesSuiteTbl` |
-| **Función** | Lee cola SQL y programa en API Push | PASO 1 y 2 del flujo |
-
----
-
-### Componentes del Sistema de Orquestación
-
-#### **FASE 1: Generación**
-| Componente | Detalle |
-|------------|---------|
-| **Responsable** | Stored Procedures de módulos de negocio |
-| **Acción** | INSERT en `conEmisionNotificacionesSuiteTbl` |
-| **Base de Datos** | SQL Server |
-| **Estado** | `idEstatus = 1` (Pendiente) |
-
-#### **FASE 2: Orquestación (Cloud Scheduler)**
-| Componente | Detalle |
-|------------|---------|
-| **Scheduler** | `notificaciones-reenvio-notificaciones` |
-| **Proyecto GCP** | `plowserve` |
-| **Frecuencia** | Cada 5 min |
-| **Endpoint** | `POST /api/v1/notification` |
-| **Cloud Run** | `servicionotificaciones-355837773731.us-central1.run.app` |
-
-#### **FASE 3: Transferencia (Servicio → API Push)**
-| Componente | Detalle |
-|------------|---------|
-| **Servicio Origen** | `Corp.Servicionotificaciones` (.NET 8) |
-| **Handler** | `SendNotificationCommandHandler` |
-| **Servicio** | `NotificationSuiteService` |
-| **Endpoint Destino** | `POST /v1/notification/shedule` |
-| **URL** | `https://push-api-development-800075027307.us-central1.run.app/` |
-| **Lotes** | 200 notificaciones |
-| **Rate Limiting** | 1 segundo entre envíos |
-| **Estado SQL éxito** | `idEstatus = 3` (Enviado) + `fechaEnvioNotificacion` |
-| **Estado SQL error** | `idEstatus = 4` (Error) + `observaciones` |
-
-## 🚨 Runbook Operativo
-
-### Escenario 1: Acumulación de Notificaciones Pendientes
+Esta sección consolida los escenarios operativos clave y las consultas para diagnosticar y resolver problemas.
 
 **Síntoma:** Miles de notificaciones con `idEstatus = 1` sin procesar
 
@@ -492,195 +272,39 @@ ORDER BY COUNT(*) DESC
 
 ### Escenario 4: Rendimiento Degradado
 
-**Síntoma:** El procesamiento es lento, notificaciones tardan >30 minutos
+**Síntoma:** El procesamiento es lento, las notificaciones tardan más de 15 minutos en pasar de `Pendiente` a `Enviado`.
 
 **Diagnóstico:**
 ```sql
--- Ver tiempo promedio de procesamiento últimas 24h
+-- Ver tiempo promedio de procesamiento en las últimas 24h
 SELECT 
-    AVG(DATEDIFF(MINUTE, fechaAct, fechaEnvioNotificacion)) AS MinutosPromedio,
-    MIN(DATEDIFF(MINUTE, fechaAct, fechaEnvioNotificacion)) AS MinutosMinimo,
-    MAX(DATEDIFF(MINUTE, fechaAct, fechaEnvioNotificacion)) AS MinutosMaximo,
-    COUNT(*) AS TotalEnviadas
+    AVG(DATEDIFF(MINUTE, fechaAct, fechaEnvioNotificacion)) AS MinutosPromedio
 FROM conEmisionNotificacionesSuiteTbl
 WHERE idEstatus = 3
-  AND fechaEnvioNotificacion >= DATEADD(HOUR, -24, GETDATE())
-  AND fechaEnvioNotificacion IS NOT NULL
+  AND fechaEnvioNotificacion >= DATEADD(HOUR, -24, GETDATE());
 ```
 
-**Posibles causas:**
+**Posibles Causas y Soluciones:**
+1.  **Volumen Excesivo:**
+    *   **Causa:** Picos de generación de notificaciones.
+    *   **Solución:** Considerar aumentar la frecuencia del scheduler (de 5 a 2 min) o el tamaño del lote (de 200 a 400).
+2.  **Fragmentación de Índices:**
+    *   **Causa:** El índice sobre `idEstatus` está fragmentado.
+    *   **Solución:** Reorganizar/reconstruir el índice `IX_idEstatus`.
+3.  **Latencia en API Push:**
+    *   **Causa:** La API Push responde lento.
+    *   **Solución:** Revisar logs del Cloud Run del *Servicio Notificaciones* para identificar timeouts o latencia alta en las llamadas a la API Push.
 
-1. **Volumen excesivo**
-   - Verificar si hay picos de generación de notificaciones
-   - Considerar aumentar frecuencia del scheduler (de 5 min a 2 min)
-   - Aumentar tamaño de lote (de 200 a 500)
+## 📦 Matriz de Componentes e Infraestructura
 
-2. **Fragmentación de índices**
-   - Ejecutar query de verificación de fragmentación (ver sección Mantenimiento)
-   - Reorganizar/reconstruir índices según nivel de fragmentación
-
-3. **Latencia en servicio de Notification Suite**
-   - Medir tiempo de respuesta del servicio externo
-   - Revisar logs del Cloud Run para identificar cuello de botella
-
----
-
-### Troubleshooting Rápido
-
-**Problema:** El scheduler se ejecuta pero no procesa notificaciones
-
-**Diagnóstico:**
-```sql
--- ¿Hay registros en estado "Procesando" atascados?
-SELECT * FROM conEmisionNotificacionesSuiteTbl 
-WHERE idEstatus = 2
-ORDER BY fechaAct
-```
-
-**Solución:**
-```sql
--- Reset manual de registros atascados (más de 1 hora)
-UPDATE conEmisionNotificacionesSuiteTbl
-SET idEstatus = 1,  -- Volver a Pendiente
-    observaciones = 'Reset manual: ' + CONVERT(VARCHAR, GETDATE(), 120)
-WHERE idEstatus = 2
-  AND fechaAct < DATEADD(HOUR, -1, GETDATE())
-```
-
----
-
-**Problema:** Errores masivos en el envío
-
-**Diagnóstico:**
-```sql
--- Ver los mensajes de error más comunes
-SELECT TOP 10 
-    observaciones,
-    COUNT(*) AS Cantidad
-FROM conEmisionNotificacionesSuiteTbl
-WHERE idEstatus = 4
-  AND fechaAct >= DATEADD(HOUR, -1, GETDATE())
-GROUP BY observaciones
-ORDER BY COUNT(*) DESC
-```
-
-**Acciones:**
-- Si es error de conectividad: Verificar estado del servicio de notificaciones
-- Si es timeout: Considerar aumentar el delay entre envíos
-- Si es error de validación: Revisar formato de los datos generados por los SPs
-
-## 📈 Capacidad y Escalabilidad
-
-### Límites Actuales
-
-| Componente | Límite Actual | Límite Técnico | Comentarios |
-|------------|---------------|----------------|-------------|
-| **Frecuencia scheduler** | Cada 5 min | Cada 1 min (GCP) | Ajustable en cron expression |
-| **Tamaño de lote** | 200 notif | ~600 (timeout 3 min) | 1 seg delay × 200 = ~200 seg |
-| **Rate limiting** | 1 notif/seg | Configurable | Previene saturación del servicio destino |
-| **Timeout Cloud Run** | 180 seg | 3600 seg (1 hora) | Configuración de Cloud Run |
-| **Capacidad horaria** | ~2,400 notif/h | ~7,200 con ajustes | 12 ejecuciones × 200 notif |
-
-## 🛠️ Mantenimiento y Limpieza
-
-### Purga de Notificaciones Antiguas
-
-```sql
--- Eliminar notificaciones enviadas hace más de 90 días
--- (mantiene las con error para análisis)
-DELETE FROM conEmisionNotificacionesSuiteTbl
-WHERE idEstatus = 3  -- Enviado
-  AND fechaEnvioNotificacion < DATEADD(day, -90, GETDATE())
-
--- Ejecutar mensualmente para evitar crecimiento excesivo
-```
-
-### Reintento Manual de Notificaciones con Error
-
-⚠️ **IMPORTANTE:** El reintento automático NO está implementado. Los reintentos deben ejecutarse manualmente mediante este script SQL.
-
-```sql
--- Reintentar notificaciones que fallaron hace más de 1 hora (EJECUCIÓN MANUAL)
-UPDATE conEmisionNotificacionesSuiteTbl
-SET idEstatus = 1,  -- Volver a Pendiente
-    observaciones = observaciones + ' | Reintento: ' + CONVERT(VARCHAR, GETDATE(), 120)
-WHERE idEstatus = 4  -- Con Error
-  AND fechaAct < DATEADD(HOUR, -1, GETDATE())
-  AND observaciones NOT LIKE '%Reintento%Reintento%'  -- Máximo 2 reintentos
-```
-
-## 📦 Especificaciones Técnicas
-
-### Stack Tecnológico
-
-| Capa | Tecnología | Versión |
-|------|------------|---------||
-| **Backend** | .NET | 8.0 |
-| **Arquitectura** | Clean Architecture + CQRS | MediatR |
-| **ORM** | Entity Framework Core | 8.x |
-| **Base de Datos** | SQL Server(ncti) | 2019+ |
-| **Cloud Platform** | Google Cloud Platform | - |
-| **Compute** | Cloud Run | Gen 2 |
-| **Orchestration** | Cloud Scheduler | - |
-| **Logging** | Cloud Logging | - |
-| **Monitoring** | Cloud Monitoring | - |
-
-### Componentes del Sistema
-
-| Componente | Tipo | Propósito | Ubicación |
-|------------|------|-----------|-------------|
-| `conEmisionNotificacionesSuiteTbl` | Tabla SQL | Cola persistente de notificaciones | SQL Server NCTI |
-| Índices (4) | Índices SQL | Optimización de consultas del procesador | SQL Server NCTI |
-| 10 Stored Procedures | SPs | Generadores de notificaciones por módulo | SQL Server NCTI |
-| `SendNotificationCommandHandler` | C# Handler | Procesador de cola (lotes de 200) | Cloud Run |
-| Cloud Scheduler | GCP Scheduler | Trigger automático cada 5 min | GCP us-central1 |
-| `NotificationController` | API Endpoint | POST /api/v1/notification | Cloud Run |
-| `INotificationSuiteService` | Servicio HTTP | Integración con API Push | Cloud Run |
-| Catálogo de Estados | Datos maestros | Define estados del ciclo de vida (1-4) | SQL Server NCTI |
-
-
-## 📚 Información Técnica Adicional
-
-### Archivos Modificados en Feature
-
-| Tipo | Archivo | Función |
-|------|---------|---------|
-| 📋 Data | `Insert_catGeneralesTbl_conEmisionNotificacionesSuiteTbl_idEstatus.sql` | Catálogo de estados (1-4) |
-| 🗄️ Table | `conEmisionNotificacionesSuiteTbl.sql` | Tabla principal de cola |
-| 🔧 SP | `Spc_listaDatosNotificacion0.sql` | Notificaciones generales Origen 8 |
-| 🔧 SP | `Spp_EnviaNotificacionesCampana.sql` | Campañas masivas (App 34) |
-| 🔧 SP | `Spp_CorreoPrestamosDispersados.sql` | Notificación de préstamos dispersados |
-| 🔧 SP | `Spp_CorreosRecibosEspeciales.sql` | Recibos especiales (Origen 8) |
-| 🔧 SP | `Spp_CorreosRecibosGenericos.sql` | Recibos genéricos de nómina |
-| 🔧 SP | `Spp_ConfirmaDepCreditosEspeciales.sql` | Confirmación de créditos especiales |
-| 🔧 SP | `Spp_EnviaEstadisticasPush.sql` | Estadísticas push a usuarios |
-| 🔧 SP | `Spp_EnviaNotificacionMovEmpleadosEL.sql` | Movimientos de empleados |
-| 🔧 SP | `Spp_enviaCorreoIncidencia.sql` | Notificaciones de incidencias |
-| 🔧 SP | `Spp_ProcesaPushV7.sql` | Procesamiento push con filtro origen |
-
-**Total:** 12 objetos base de datos (2 nuevos + 10 modificados) + componentes del servicio
-
-### Componentes del Servicio de Procesamiento
-
-| Tipo | Archivo | Función |
-|------|---------|---------|
-| 🎮 Controller | `NotificationController.cs` | Endpoint POST /api/v1/notification |
-| 📨 Command | `SendNotificationCommand.cs` | Comando MediatR para procesar cola |
-| ⚙️ Handler | `SendNotificationCommandHandler.cs` | Lógica de procesamiento por lotes |
-| 🗄️ Repository | `ConEmisionNotificacionesSuiteTblRepository.cs` | Acceso a datos de la cola |
-| 📡 Service | `NotificationSuiteService.cs` | Integración con servicio push AppSuite |
-| 🏗️ Entity | `ConEmisionNotificacionesSuite.cs` | Entidad del dominio |
-| 🔧 Config | `ConEmisionNotificacionesSuiteEntityType.cs` | Configuración EF Core |
-
-### Infraestructura Cloud
-
-| Componente | Servicio | Detalle |
-|------------|----------|---------|
-| **Procesador** | Cloud Run | `servicionotificaciones-development-782007426780.us-central1.run.app` |
-| **Scheduler** | Cloud Scheduler | `notificaciones-reenvio-notificaciones` |
-| **Proyecto GCP** | Google Cloud | `plowserve` |
-| **Región** | GCP Region | `us-central1` |
-| **Base de Datos** | SQL Server | `NCTI` database |
+| Capa | Componente | Tecnología/Servicio | Ubicación/Endpoint |
+|---|---|---|---|
+| **Datos** | `conEmisionNotificacionesSuiteTbl` | SQL Server | Base de Datos `NCTI` |
+| | Stored Procedures (SPs) | T-SQL | Base de Datos `NCTI` |
+| **Orquestación** | `notificaciones-reenvio-notificaciones` | GCP Cloud Scheduler | `us-central1`, Proyecto `plowserve` |
+| **Procesamiento** | Servicio Notificaciones | .NET 8 / Cloud Run | `servicionotificaciones-development-782007426780.us-central1.run.app` |
+| | `SendNotificationCommandHandler` | MediatR (C#) | Lógica de lotes y delays |
+| **Integración** | API Notificaciones Push | .NET 8 / Cloud Run | `push-api-development-800075027307.us-central1.run.app/v1/notification/shedule` |
 
 ---
 
